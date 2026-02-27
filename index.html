@@ -1,0 +1,865 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { 
+  UploadCloud, 
+  Settings, 
+  X, 
+  CheckCircle2, 
+  Loader2, 
+  Download, 
+  Image as ImageIcon,
+  Key,
+  AlertCircle,
+  Copy,
+  Camera,
+  Film,
+  PenTool,
+  RotateCcw,
+  Sparkles
+} from 'lucide-react';
+
+// Kunci API bawaan dari lingkungan (akan diisi otomatis oleh sistem jika tersedia)
+const DEFAULT_API_KEY = "";
+
+export default function App() {
+  const [files, setFiles] = useState([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [savedApiKey, setSavedApiKey] = useState('');
+  const [keyTierInput, setKeyTierInput] = useState('gratis'); // 'gratis', 'berbayar'
+  const [savedKeyTier, setSavedKeyTier] = useState('gratis');
+  const [globalError, setGlobalError] = useState('');
+  const [assetType, setAssetType] = useState('foto'); // 'foto', 'video', 'vektor'
+  const [dialog, setDialog] = useState({ type: null, message: '', onConfirm: null });
+
+  const fileInputRef = useRef(null);
+
+  // Memuat API Key dari localStorage
+  useEffect(() => {
+    const storedKey = localStorage.getItem('gemini_custom_api_key');
+    const storedTier = localStorage.getItem('gemini_api_key_tier');
+    
+    if (storedKey) {
+      setSavedApiKey(storedKey);
+      setApiKeyInput(storedKey);
+      if (storedTier) {
+        setSavedKeyTier(storedTier);
+        setKeyTierInput(storedTier);
+      } else {
+        setSavedKeyTier('gratis');
+        setKeyTierInput('gratis');
+      }
+    }
+  }, []);
+
+  const openSettings = () => {
+    setApiKeyInput(savedApiKey);
+    setKeyTierInput(savedKeyTier || 'gratis');
+    setShowSettings(true);
+  };
+
+  const handleSaveApiKey = () => {
+    if (!apiKeyInput.trim()) {
+      alert('Silakan masukkan API Key Anda terlebih dahulu.');
+      return;
+    }
+
+    localStorage.setItem('gemini_custom_api_key', apiKeyInput);
+    localStorage.setItem('gemini_api_key_tier', keyTierInput);
+    setSavedApiKey(apiKeyInput);
+    setSavedKeyTier(keyTierInput);
+    
+    setShowSettings(false);
+  };
+
+  const generateVideoThumbnail = (file) => {
+    return new Promise((resolve) => {
+      const video = document.createElement('video');
+      video.preload = 'auto'; // Load data video, bukan cuma metadata
+      video.playsInline = true;
+      video.muted = true;
+      
+      // Setup timeout agar tidak hang jika video gagal di-load
+      let timeoutId = setTimeout(() => {
+        console.warn("Waktu ekstraksi video habis.");
+        cleanUp();
+        resolve(null);
+      }, 10000); // 10 detik maksimal
+
+      const objectUrl = URL.createObjectURL(file);
+      
+      const cleanUp = () => {
+        clearTimeout(timeoutId);
+        URL.revokeObjectURL(objectUrl);
+        video.removeAttribute('src');
+        video.load();
+      };
+
+      video.addEventListener('loadeddata', () => {
+        // Ambil frame di detik ke-1 untuk menghindari intro hitam,
+        // jika video kurang dari 2 detik, ambil pertengahannya.
+        let targetTime = 1;
+        if (video.duration && video.duration < 2) {
+          targetTime = video.duration / 2 || 0;
+        }
+        video.currentTime = targetTime;
+      });
+
+      video.addEventListener('seeked', () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = video.videoWidth || 640;
+          canvas.height = video.videoHeight || 360;
+          const ctx = canvas.getContext('2d');
+          
+          // Gambar video ke canvas
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+          
+          resolve(dataUrl);
+        } catch (e) {
+          console.error("Gagal menggambar frame video:", e);
+          resolve(null);
+        } finally {
+          cleanUp();
+        }
+      });
+
+      video.addEventListener('error', () => {
+        console.error("Video error saat diload");
+        cleanUp();
+        resolve(null);
+      });
+
+      video.src = objectUrl;
+      video.load();
+    });
+  };
+
+  const onFileSelect = async (e) => {
+    const selectedFiles = Array.from(e.target.files);
+    if (selectedFiles.length === 0) return;
+
+    const validFiles = [];
+    const rejectedFiles = [];
+
+    for (let file of selectedFiles) {
+      const fileName = file.name.toLowerCase();
+      if (fileName.endsWith('.eps') || fileName.endsWith('.ai')) {
+        rejectedFiles.push(file.name);
+      } else {
+        validFiles.push(file);
+      }
+    }
+
+    if (rejectedFiles.length > 0) {
+      setDialog({
+        type: 'alert',
+        message: `Format EPS dan AI tidak dapat dibaca langsung oleh aplikasi web ini.\nUntuk menganalisis vektor, silakan unggah file "JPG/SVG Preview" dari vektor tersebut.\n\nFile yang diabaikan: ${rejectedFiles.join(', ')}`,
+        onConfirm: () => setDialog({ type: null, message: '', onConfirm: null })
+      });
+    }
+
+    if (validFiles.length === 0) {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
+
+    const tempFiles = validFiles.map(function(file) {
+      return {
+        id: crypto.randomUUID(),
+        originalFile: file,
+        name: file.name,
+        previewUrl: null,
+        status: 'pending', 
+        metadata: null,
+        errorMsg: null,
+        isLoadingPreview: file.type.startsWith('video/')
+      };
+    });
+
+    setFiles(prev => [...prev, ...tempFiles]);
+
+    for (let tempFile of tempFiles) {
+      if (tempFile.isLoadingPreview) {
+        const thumb = await generateVideoThumbnail(tempFile.originalFile);
+        setFiles(prev => prev.map(function(f) {
+          return f.id === tempFile.id ? {
+            ...f,
+            previewUrl: thumb || '', // Jika thumb null, akan pakai string kosong dan memunculkan efek broken image fallback
+            isLoadingPreview: false,
+            errorMsg: thumb === null ? "Gagal membaca thumbnail video" : null,
+            status: thumb === null ? 'error' : 'pending' // langsung error jika gagal agar tak diproses AI
+          } : f;
+        }));
+      } else {
+        setFiles(prev => prev.map(function(f) {
+          return f.id === tempFile.id ? {
+            ...f,
+            previewUrl: URL.createObjectURL(tempFile.originalFile)
+          } : f;
+        }));
+      }
+    }
+    
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const removeFile = (id) => {
+    setFiles(function(prev) { return prev.filter(function(f) { return f.id !== id; }); });
+  };
+
+  const handleReset = () => {
+    setDialog({
+      type: 'confirm',
+      message: 'Apakah Anda yakin ingin menghapus semua file dan memulai dari awal?',
+      onConfirm: function() {
+        setFiles([]);
+        setGlobalError('');
+        if (fileInputRef.current) fileInputRef.current.value = '';
+        setDialog({ type: null, message: '', onConfirm: null });
+      }
+    });
+  };
+
+  const readFileAsBase64 = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64String = reader.result.split(',')[1];
+        resolve({
+          mimeType: file.type,
+          data: base64String
+        });
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const fetchWithRetry = async (url, options, maxRetries = 5) => {
+    const delays = [1000, 2000, 4000, 8000, 16000];
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        const response = await fetch(url, options);
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        return await response.json();
+      } catch (error) {
+        if (i === maxRetries - 1) throw error;
+        await new Promise(resolve => setTimeout(resolve, delays[i]));
+      }
+    }
+  };
+
+  const processFiles = async () => {
+    const pendingFiles = files.filter(function(f) { return f.status === 'pending'; });
+    if (pendingFiles.length === 0) return;
+
+    if (!savedApiKey) {
+      setDialog({
+        type: 'alert',
+        message: 'API Key belum diatur.\n\nAnda wajib memasukkan API Key Google Gemini (Gratis/Berbayar) untuk memproses file. Silakan buka menu Pengaturan Akses API di pojok kanan atas.',
+        onConfirm: function() {
+          setDialog({ type: null, message: '', onConfirm: null });
+          setShowSettings(true);
+        }
+      });
+      return;
+    }
+
+    setIsProcessing(true);
+    setGlobalError('');
+
+    const apiKey = savedApiKey;
+    const modelName = "gemini-1.5-flash";
+
+    let promptTypeAddon = "";
+    if (assetType === 'vektor') {
+      promptTypeAddon = "Ini adalah sebuah ilustrasi/vektor. Pastikan untuk menyertakan kata kunci yang relevan dengan vektor (seperti: vector, illustration, graphic, design, art, flat, eps, dll). Judul juga harus mencerminkan bahwa ini adalah vektor/ilustrasi.";
+    } else if (assetType === 'video') {
+      promptTypeAddon = "Ini adalah cuplikan (frame) dari sebuah video/footage. Pastikan untuk menyertakan kata kunci yang relevan dengan video (seperti: video, footage, motion, clip, animation, b-roll, dll). Judul juga harus mencerminkan bahwa ini adalah video/footage.";
+    } else {
+      promptTypeAddon = "Ini adalah sebuah foto/gambar fotografi. Fokus pada elemen visual, subjek, suasana, dan pencahayaan.";
+    }
+
+    for (let fileObj of pendingFiles) {
+      setFiles(prev => prev.map(function(f) { return f.id === fileObj.id ? { ...f, status: 'processing' } : f; }));
+
+      try {
+        let base64Data;
+        
+        if (fileObj.originalFile.type.startsWith('video/')) {
+          if (!fileObj.previewUrl || !fileObj.previewUrl.startsWith('data:')) {
+            throw new Error("Gagal mengekstrak frame dari video. Silakan coba file lain.");
+          }
+          base64Data = {
+            mimeType: 'image/jpeg',
+            data: fileObj.previewUrl.split(',')[1]
+          };
+        } else {
+          base64Data = await readFileAsBase64(fileObj.originalFile);
+        }
+        
+        const prompt = `
+          Anda adalah seorang ahli SEO dan kontributor Microstock (Shutterstock, Adobe Stock).
+          ${promptTypeAddon}
+          Analisis gambar/thumbnail ini dan hasilkan metadata yang optimal untuk penjualan microstock.
+          Berikan tepat 35 kata kunci (keywords) yang sangat relevan, diurutkan dari yang paling penting.
+          Kata kunci harus berupa kata tunggal atau frasa pendek (maks 2 kata).
+          
+          KEMBALIKAN HANYA DALAM FORMAT JSON BERIKUT, TANPA MARKDOWN ATAU TEKS LAIN:
+          {
+            "title": "Judul deskriptif, SEO friendly, maksimal 200 karakter, dalam bahasa Inggris",
+            "description": "Deskripsi yang lebih detail tentang gambar, dalam bahasa Inggris",
+            "keywords": ["keyword1", "keyword2", "keyword3", ... sampai 35 kata kunci]
+          }
+        `;
+
+        const payload = {
+          contents: [{
+            role: "user",
+            parts: [
+              { text: prompt },
+              { inlineData: base64Data }
+            ]
+          }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: "OBJECT",
+              properties: {
+                title: { type: "STRING" },
+                description: { type: "STRING" },
+                keywords: { type: "ARRAY", items: { type: "STRING" } }
+              },
+              required: ["title", "description", "keywords"]
+            }
+          }
+        };
+
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+        
+        const result = await fetchWithRetry(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const textResponse = result.candidates?.[0]?.content?.parts?.[0]?.text;
+        
+        if (!textResponse) {
+          throw new Error("Respons API kosong atau format tidak sesuai.");
+        }
+
+        const metadata = JSON.parse(textResponse);
+
+        if (!metadata.title || !metadata.keywords || !Array.isArray(metadata.keywords)) {
+             throw new Error("Format JSON dari AI tidak lengkap.");
+        }
+
+        setFiles(prev => prev.map(function(f) { return f.id === fileObj.id ? { 
+          ...f, 
+          status: 'success', 
+          metadata: {
+            title: metadata.title,
+            description: metadata.description || metadata.title,
+            keywords: metadata.keywords.slice(0, 35) 
+          } 
+        } : f; }));
+
+      } catch (error) {
+        console.error("Error processing file:", error);
+        setFiles(prev => prev.map(function(f) { return f.id === fileObj.id ? { 
+          ...f, 
+          status: 'error', 
+          errorMsg: error.message || "Gagal memproses gambar" 
+        } : f; }));
+      }
+    }
+
+    setIsProcessing(false);
+  };
+
+  const downloadCSV = () => {
+    const successfulFiles = files.filter(function(f) { return f.status === 'success' && f.metadata; });
+    if (successfulFiles.length === 0) return;
+
+    const headers = ["Filename", "Title", "Keywords", "Category", "Releases"];
+    
+    const rows = successfulFiles.map(function(file) {
+      const escapeCSV = (str) => `"${String(str).replace(/"/g, '""')}"`;
+      
+      const filename = escapeCSV(file.name);
+      const title = escapeCSV(file.metadata.title);
+      const keywords = escapeCSV(file.metadata.keywords.join(", "));
+      const category = ""; 
+      const releases = ""; 
+      
+      return [filename, title, keywords, category, releases].join(",");
+    });
+
+    const csvContent = [headers.join(","), ...rows].join("\n");
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", "microstock_metadata.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const copyToClipboard = (text) => {
+    try {
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.style.position = "fixed";
+      textArea.style.left = "-999999px";
+      textArea.style.top = "-999999px";
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      document.execCommand('copy');
+      textArea.remove();
+    } catch (err) {
+      console.error('Failed to copy', err);
+    }
+  };
+
+  // PRA-KALKULASI (Memindahkan logika JSX bermasalah agar parser tidak terganggu)
+  const processedCount = files.filter(function(f) { return f.status === 'success'; }).length;
+  const completedCount = files.filter(function(f) { return f.status === 'success' || f.status === 'error'; }).length;
+  const totalCount = files.length;
+  const progressPercentage = totalCount === 0 ? 0 : Math.round((completedCount / totalCount) * 100);
+
+  const hasFiles = files.length !== 0; // Menggunakan !== 0 sebagai ganti dari simbol lebih besar
+  const hasPendingFiles = files.some(function(f) { return f.status === 'pending'; });
+  const isGenerateDisabled = isProcessing || !hasPendingFiles;
+  const showProgress = isProcessing || completedCount !== 0; // Menggunakan !== 0
+
+  const handleDropzoneClick = function() {
+    if (fileInputRef.current) fileInputRef.current.click();
+  };
+
+  const handleApiInputChange = function(e) {
+    setApiKeyInput(e.target.value);
+  };
+
+  const handleRemoveKey = function() {
+    localStorage.removeItem('gemini_custom_api_key');
+    localStorage.removeItem('gemini_api_key_tier');
+    setSavedApiKey('');
+    setApiKeyInput('');
+    setSavedKeyTier('gratis');
+    setKeyTierInput('gratis');
+    setShowSettings(false);
+  };
+
+  const handleCloseDialog = function() {
+    setDialog({ type: null, message: '', onConfirm: null });
+  };
+
+  const handleImageError = function(e) {
+    e.target.style.display = 'none';
+    if (e.target.nextSibling) {
+      e.target.nextSibling.style.display = 'flex';
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-indigo-500 selection:text-white pb-20">
+      
+      {/* Header Glassmorphism */}
+      <header className="border-b border-slate-200/80 px-6 py-4 flex items-center justify-between sticky top-0 bg-white/70 backdrop-blur-xl z-20 shadow-sm">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-gradient-to-br from-indigo-500 to-violet-600 text-white flex items-center justify-center rounded-xl shadow-md shadow-indigo-500/20">
+            <Sparkles size={20} className="text-white" />
+          </div>
+          <h1 className="font-extrabold text-2xl tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-indigo-900 to-violet-800">
+            Ultimate<span className="font-light text-slate-500">metadata</span>
+          </h1>
+        </div>
+        <button 
+          onClick={openSettings}
+          className={`px-4 py-2 rounded-xl text-sm font-semibold flex items-center gap-2 transition-all shadow-sm hover:shadow active:scale-95 ${
+            savedApiKey && savedKeyTier === 'berbayar' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100' : 
+            savedApiKey && savedKeyTier === 'gratis' ? 'bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100' : 
+            'bg-white border border-slate-200 hover:bg-slate-50 text-slate-700'
+          }`}
+        >
+          <Key size={16} />
+          {savedApiKey && savedKeyTier === 'berbayar' ? 'Key Berbayar Aktif' : 
+           savedApiKey && savedKeyTier === 'gratis' ? 'Key Gratis Aktif' : 
+           'Masukkan API Key'}
+        </button>
+      </header>
+
+      <main className="max-w-5xl mx-auto p-6 space-y-8 mt-4">
+        
+        {globalError && (
+          <div className="bg-red-50 text-red-700 p-4 rounded-xl border border-red-200 shadow-sm flex items-start gap-3 animate-in fade-in slide-in-from-top-4">
+            <AlertCircle className="shrink-0 mt-0.5" size={18} />
+            <p className="text-sm font-medium">{globalError}</p>
+          </div>
+        )}
+
+        {/* Segmented Control Tabs */}
+        <div className="flex justify-center">
+          <div className="bg-slate-200/60 p-1.5 rounded-2xl inline-flex shadow-inner">
+            <button 
+              onClick={setAssetType.bind(null, 'foto')}
+              className={`px-6 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-2 transition-all duration-300 ${assetType === 'foto' ? 'bg-white shadow-md text-indigo-700' : 'text-slate-500 hover:text-slate-800'}`}
+            >
+              <Camera size={18} /> Fotografi
+            </button>
+            <button 
+              onClick={setAssetType.bind(null, 'video')}
+              className={`px-6 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-2 transition-all duration-300 ${assetType === 'video' ? 'bg-white shadow-md text-indigo-700' : 'text-slate-500 hover:text-slate-800'}`}
+            >
+              <Film size={18} /> Footage
+            </button>
+            <button 
+              onClick={setAssetType.bind(null, 'vektor')}
+              className={`px-6 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-2 transition-all duration-300 ${assetType === 'vektor' ? 'bg-white shadow-md text-indigo-700' : 'text-slate-500 hover:text-slate-800'}`}
+            >
+              <PenTool size={18} /> Vektor/Ilustrasi
+            </button>
+          </div>
+        </div>
+
+        {/* Upload Dropzone */}
+        <section className="bg-white rounded-3xl p-2 sm:p-4 shadow-sm border border-slate-200/60">
+          <div 
+            className="border-2 border-dashed border-indigo-200 hover:border-indigo-400 hover:bg-indigo-50/50 transition-all duration-300 rounded-2xl p-12 flex flex-col items-center justify-center text-center cursor-pointer group"
+            onClick={handleDropzoneClick}
+          >
+            <div className="w-20 h-20 bg-indigo-50 rounded-full flex items-center justify-center mb-4 group-hover:scale-110 transition-transform duration-300 shadow-sm">
+              <UploadCloud size={36} className="text-indigo-500" />
+            </div>
+            <h2 className="text-2xl font-bold text-slate-800 mb-2">Unggah File Bahan</h2>
+            <p className="text-slate-500 text-sm max-w-md leading-relaxed">
+              Tarik & lepas file Anda ke sini, atau klik untuk menelusuri. Mendukung JPG, PNG, SVG, MP4, dan WebM.
+            </p>
+            <input 
+              type="file" 
+              multiple 
+              accept="image/*,.svg,video/mp4,video/webm,video/quicktime" 
+              className="hidden" 
+              ref={fileInputRef}
+              onChange={onFileSelect}
+            />
+            <button className="mt-8 px-8 py-3 bg-white border border-slate-200 text-slate-700 text-sm font-bold rounded-xl shadow-sm hover:shadow focus:ring-4 focus:ring-indigo-50 transition-all">
+              Pilih dari Komputer
+            </button>
+          </div>
+        </section>
+
+        {/* Actions & Progress Bar */}
+        {hasFiles && (
+          <div className="bg-white p-5 rounded-3xl shadow-sm border border-slate-200 space-y-5 animate-in fade-in">
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
+              <div className="text-sm font-semibold text-slate-600 bg-slate-100 px-4 py-2 rounded-lg">
+                <span className="text-indigo-600 font-bold">{processedCount}</span> dari {totalCount} berhasil
+              </div>
+              <div className="flex flex-wrap gap-3">
+                <button 
+                  onClick={handleReset}
+                  disabled={isProcessing}
+                  className="px-5 py-2.5 bg-white border border-red-200 text-red-600 text-sm font-bold rounded-xl hover:bg-red-50 hover:shadow-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition-all active:scale-95"
+                >
+                  <RotateCcw size={16} /> Reset
+                </button>
+
+                <button 
+                  onClick={downloadCSV}
+                  disabled={processedCount === 0 || isProcessing}
+                  className="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 text-sm font-bold rounded-xl hover:bg-slate-50 hover:shadow-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition-all active:scale-95"
+                >
+                  <Download size={16} /> Unduh CSV
+                </button>
+
+                <button 
+                  onClick={processFiles}
+                  disabled={isGenerateDisabled}
+                  className="px-6 py-2.5 bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow-md shadow-indigo-500/30 hover:shadow-lg hover:shadow-indigo-500/40 hover:-translate-y-0.5 text-sm font-bold rounded-xl disabled:opacity-60 disabled:cursor-not-allowed disabled:transform-none flex items-center gap-2 transition-all active:scale-95"
+                >
+                  {isProcessing ? <Loader2 size={18} className="animate-spin" /> : <Sparkles size={18} />}
+                  {isProcessing ? 'Memproses...' : 'GENERATE'}
+                </button>
+              </div>
+            </div>
+
+            {/* Progress Bar with Gradient */}
+            {showProgress && (
+              <div className="space-y-2 pt-4 border-t border-slate-100">
+                <div className="flex justify-between text-xs font-bold text-slate-500 uppercase tracking-widest">
+                  <span>
+                    {isProcessing 
+                      ? 'AI Sedang Bekerja...' 
+                      : progressPercentage === 100 
+                        ? '✨ Selesai Sepenuhnya!' 
+                        : 'Proses Terhenti.'}
+                  </span>
+                  <span className="text-indigo-600">{progressPercentage}%</span>
+                </div>
+                <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden shadow-inner">
+                  <div 
+                    className="h-full rounded-full transition-all duration-500 ease-out bg-gradient-to-r from-indigo-500 to-violet-500 relative" 
+                    style={{ width: `${progressPercentage}%` }}
+                  >
+                    {isProcessing && (
+                      <div className="absolute top-0 left-0 bottom-0 right-0 bg-white/20 animate-pulse"></div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* File List Cards */}
+        <section className="grid grid-cols-1 gap-5">
+          {files.map(function(file) {
+            return (
+              <div key={file.id} className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden flex flex-col md:flex-row hover:shadow-md hover:border-indigo-200 transition-all duration-300 group">
+                
+                {/* Thumbnail Area */}
+                <div className="md:w-72 bg-slate-100 relative shrink-0 border-r border-slate-100">
+                  {file.isLoadingPreview ? (
+                    <div className="w-full h-56 md:h-full flex items-center justify-center">
+                      <Loader2 className="animate-spin text-slate-400" size={28} />
+                    </div>
+                  ) : (
+                    <img 
+                      src={file.previewUrl} 
+                      alt={file.name} 
+                      className="w-full h-56 md:h-full object-cover"
+                      onError={handleImageError}
+                    />
+                  )}
+                  
+                  {/* Fallback box jika img onError */}
+                  <div style={{ display: !file.isLoadingPreview && !file.previewUrl ? 'flex' : 'none' }} className="w-full h-56 md:h-full items-center justify-center bg-slate-100 text-slate-400 text-xs font-medium">
+                    No Thumbnail
+                  </div>
+
+                  {/* Overlay gradient for readability */}
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-60"></div>
+
+                  <button 
+                    onClick={removeFile.bind(null, file.id)}
+                    className="absolute top-3 right-3 p-2 bg-white/90 backdrop-blur-sm text-slate-700 rounded-xl shadow-sm opacity-0 group-hover:opacity-100 transition-all hover:bg-red-50 hover:text-red-600 active:scale-95"
+                  >
+                    <X size={16} />
+                  </button>
+                  
+                  {/* Status Badges */}
+                  <div className="absolute bottom-3 left-3">
+                    {file.status === 'pending' && <span className="px-3 py-1.5 bg-white/90 backdrop-blur-md text-slate-700 font-bold text-xs rounded-lg shadow-sm">Menunggu</span>}
+                    {file.status === 'processing' && <span className="px-3 py-1.5 bg-indigo-600/90 backdrop-blur-md text-white font-bold text-xs rounded-lg shadow-sm shadow-indigo-500/20 flex items-center gap-2"><Loader2 size={12} className="animate-spin"/> Menganalisis...</span>}
+                    {file.status === 'success' && <span className="px-3 py-1.5 bg-emerald-500/90 backdrop-blur-md text-white font-bold text-xs rounded-lg shadow-sm shadow-emerald-500/20 flex items-center gap-1.5"><CheckCircle2 size={12}/> Sukses</span>}
+                    {file.status === 'error' && <span className="px-3 py-1.5 bg-red-500/90 backdrop-blur-md text-white font-bold text-xs rounded-lg shadow-sm shadow-red-500/20">Gagal</span>}
+                  </div>
+                </div>
+
+                {/* Data Area */}
+                <div className="p-6 flex-1 min-w-0 flex flex-col justify-center">
+                  <div className="text-xs font-semibold text-slate-400 mb-4 truncate bg-slate-50 inline-block px-3 py-1 rounded-lg border border-slate-100 max-w-max" title={file.name}>
+                    {file.name}
+                  </div>
+
+                  {file.status === 'success' && file.metadata ? (
+                    <div className="space-y-5">
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="text-xs font-extrabold uppercase tracking-widest text-indigo-500">Judul Deskriptif</label>
+                          <button onClick={copyToClipboard.bind(null, file.metadata.title)} className="text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 px-2 py-1 rounded-md transition-colors flex items-center gap-1 text-xs font-semibold">
+                            <Copy size={12} /> Salin
+                          </button>
+                        </div>
+                        <p className="text-slate-800 text-[15px] font-medium leading-relaxed bg-slate-50 p-3 rounded-xl border border-slate-100">{file.metadata.title}</p>
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="text-xs font-extrabold uppercase tracking-widest text-indigo-500">Kata Kunci ({file.metadata.keywords.length})</label>
+                          <button onClick={copyToClipboard.bind(null, file.metadata.keywords.join(", "))} className="text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 px-2 py-1 rounded-md transition-colors flex items-center gap-1 text-xs font-semibold">
+                            <Copy size={12} /> Salin Semua
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {file.metadata.keywords.map(function(kw, idx) {
+                            return (
+                              <span key={idx} className="px-2.5 py-1 bg-white border border-slate-200 shadow-sm rounded-lg text-xs font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700 cursor-default transition-colors">
+                                {kw}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  ) : file.status === 'error' ? (
+                    <div className="h-full flex items-center justify-center text-red-500 text-sm font-medium bg-red-50 rounded-xl border border-red-100 p-4">
+                      <AlertCircle size={16} className="mr-2" />
+                      {file.errorMsg}
+                    </div>
+                  ) : (
+                    <div className="h-full flex flex-col items-center justify-center text-slate-400 text-sm py-10">
+                      <Sparkles size={24} className="mb-2 opacity-50" />
+                      <p>Metadata cerdas akan muncul di sini.</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </section>
+      </main>
+
+      {/* Modern Settings Modal */}
+      {showSettings && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in">
+          <div className="bg-white rounded-3xl shadow-2xl shadow-indigo-500/10 w-full max-w-lg overflow-hidden border border-slate-100 animate-in zoom-in-95 duration-200">
+            <div className="px-6 py-5 border-b border-slate-100 flex items-center justify-between">
+              <h3 className="font-extrabold text-lg flex items-center gap-2 text-slate-800">
+                <Key size={20} className="text-indigo-600" /> Pengaturan Akses API
+              </h3>
+              <button onClick={setShowSettings.bind(null, false)} className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-full transition-colors">
+                <X size={20} />
+              </button>
+            </div>
+            
+            <div className="p-6 space-y-5 max-h-[70vh] overflow-y-auto custom-scrollbar">
+              <p className="text-sm text-slate-500 leading-relaxed font-medium">
+                Anda wajib menggunakan Google Gemini API Key untuk menggunakan aplikasi ini. Pilih mode kecepatan yang sesuai dengan jenis Key Anda.
+              </p>
+
+              <div className="space-y-4">
+                {/* Mode Gratis */}
+                <div className={`border-2 rounded-2xl overflow-hidden transition-all ${keyTierInput === 'gratis' ? 'border-indigo-500 shadow-md shadow-indigo-500/10' : 'border-slate-100 hover:border-slate-300'}`}>
+                  <button 
+                    onClick={setKeyTierInput.bind(null, 'gratis')} 
+                    className={`w-full text-left px-5 py-4 flex items-center justify-between transition-colors ${keyTierInput === 'gratis' ? 'bg-indigo-50/50' : 'bg-white'}`}
+                  >
+                    <div className="flex items-center gap-4">
+                      <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 ${keyTierInput === 'gratis' ? 'border-indigo-600' : 'border-slate-300'}`}>
+                        {keyTierInput === 'gratis' && <div className="w-2.5 h-2.5 bg-indigo-600 rounded-full" />}
+                      </div>
+                      <div>
+                        <span className="font-bold text-sm block text-indigo-900">API Key Pribadi (Gratis)</span>
+                        <span className="text-xs text-indigo-600/70 font-medium mt-0.5 block">Lebih Cepat • Limit ~15/menit</span>
+                      </div>
+                    </div>
+                  </button>
+                  {keyTierInput === 'gratis' && (
+                    <div className="px-5 pb-5 pt-1 bg-white">
+                      <input 
+                        type="password" 
+                        value={apiKeyInput}
+                        onChange={handleApiInputChange}
+                        placeholder="Masukkan API Key Google AI Studio..."
+                        className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 transition-all text-sm font-medium"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* Mode Berbayar */}
+                <div className={`border-2 rounded-2xl overflow-hidden transition-all ${keyTierInput === 'berbayar' ? 'border-emerald-500 shadow-md shadow-emerald-500/10' : 'border-slate-100 hover:border-slate-300'}`}>
+                  <button 
+                    onClick={setKeyTierInput.bind(null, 'berbayar')} 
+                    className={`w-full text-left px-5 py-4 flex items-center justify-between transition-colors ${keyTierInput === 'berbayar' ? 'bg-emerald-50/50' : 'bg-white'}`}
+                  >
+                    <div className="flex items-center gap-4">
+                      <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 ${keyTierInput === 'berbayar' ? 'border-emerald-600' : 'border-slate-300'}`}>
+                        {keyTierInput === 'berbayar' && <div className="w-2.5 h-2.5 bg-emerald-600 rounded-full" />}
+                      </div>
+                      <div>
+                        <span className="font-bold text-sm block text-emerald-900">API Key Premium (Berbayar)</span>
+                        <span className="text-xs text-emerald-600/70 font-medium mt-0.5 block">Kecepatan Maksimal • Tanpa Antrean</span>
+                      </div>
+                    </div>
+                  </button>
+                  {keyTierInput === 'berbayar' && (
+                    <div className="px-5 pb-5 pt-1 bg-white">
+                      <input 
+                        type="password" 
+                        value={apiKeyInput}
+                        onChange={handleApiInputChange}
+                        placeholder="Masukkan API Key Pay-as-you-go..."
+                        className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 transition-all text-sm font-medium"
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+
+            </div>
+            <div className="px-6 py-5 border-t border-slate-100 bg-slate-50 flex justify-end gap-3">
+              {savedApiKey && (
+                <button 
+                  onClick={handleRemoveKey}
+                  className="px-5 py-2.5 text-red-600 text-sm font-bold hover:bg-red-50 rounded-xl transition-colors mr-auto"
+                >
+                  Hapus Key
+                </button>
+              )}
+              <button 
+                onClick={setShowSettings.bind(null, false)}
+                className="px-5 py-2.5 text-slate-600 text-sm font-bold hover:bg-slate-200 rounded-xl transition-colors"
+              >
+                Batal
+              </button>
+              <button 
+                onClick={handleSaveApiKey}
+                className="px-6 py-2.5 bg-slate-800 text-white text-sm font-bold rounded-xl hover:bg-black shadow-md shadow-slate-800/20 hover:-translate-y-0.5 transition-all active:scale-95"
+              >
+                Simpan Konfigurasi
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modern Confirm Dialog Overlay */}
+      {dialog.type && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-[60] flex items-center justify-center p-4 animate-in fade-in">
+          <div className="bg-white rounded-3xl shadow-2xl shadow-red-500/10 w-full max-w-sm overflow-hidden border border-slate-100 animate-in zoom-in-95 duration-200">
+            <div className="p-6">
+              <div className={`w-12 h-12 rounded-full flex items-center justify-center mb-4 ${dialog.type === 'confirm' ? 'bg-red-100 text-red-600' : 'bg-indigo-100 text-indigo-600'}`}>
+                <AlertCircle size={24} />
+              </div>
+              <h3 className="font-bold text-xl mb-2 text-slate-800">
+                {dialog.type === 'confirm' ? 'Hapus Semua File?' : 'Pemberitahuan'}
+              </h3>
+              <p className="text-sm text-slate-500 whitespace-pre-line leading-relaxed font-medium">
+                {dialog.message}
+              </p>
+            </div>
+            <div className="px-6 py-5 border-t border-slate-100 bg-slate-50 flex justify-end gap-3">
+              {dialog.type === 'confirm' && (
+                <button 
+                  onClick={handleCloseDialog}
+                  className="px-5 py-2.5 text-slate-600 text-sm font-bold hover:bg-slate-200 rounded-xl transition-colors"
+                >
+                  Batal
+                </button>
+              )}
+              <button 
+                onClick={dialog.onConfirm}
+                className={`px-6 py-2.5 text-white text-sm font-bold rounded-xl shadow-md hover:-translate-y-0.5 transition-all active:scale-95 ${
+                  dialog.type === 'confirm' ? 'bg-red-600 hover:bg-red-700 shadow-red-500/20' : 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-500/20'
+                }`}
+              >
+                {dialog.type === 'confirm' ? 'Ya, Hapus' : 'Mengerti'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
